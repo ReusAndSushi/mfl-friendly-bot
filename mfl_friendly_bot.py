@@ -106,6 +106,47 @@ def get_players(club_id, session=None):
     return fetch_json(f"{API}/clubs/{club_id}/players", session=session) or []
 
 
+def get_my_clubs(wallet_address, session=None):
+    url = (f"{API}/clubs?walletAddress={wallet_address}"
+           f"&withLeagueRank=true&withNextMatch=true&withPlayersCount=true&withLastMatches=true")
+    return fetch_json(url, session=session) or []
+
+
+def pick_club_interactively(wallet_address):
+    """List every club tied to this wallet (owner or staff) and let the user pick one."""
+    entries = get_my_clubs(wallet_address)
+    if not entries:
+        print("No clubs found for this account.")
+        sys.exit(1)
+
+    print("\nYour clubs:")
+    for i, e in enumerate(entries, 1):
+        c = e["club"]
+        role = e.get("title", "")
+        print(f"  [{i}] {c['name']:30s} div {c.get('division')}  {role}  (id {c['id']})")
+
+    choice = input("\nPick a club number: ").strip()
+    try:
+        idx = int(choice) - 1
+        return entries[idx]["club"]["id"]
+    except (ValueError, IndexError):
+        print("Invalid choice.")
+        sys.exit(1)
+
+
+def detect_my_wallet_address(context):
+    """Read the logged-in user's public wallet address out of the app's own
+    localStorage (CURRENT_USER.addr) - this is public profile info (it's the
+    same address already exposed in /users/<addr>/... URLs), not a secret."""
+    page = context.pages[0] if context.pages else context.new_page()
+    page.goto("https://app.playmfl.com")
+    page.wait_for_timeout(1000)
+    return page.evaluate(
+        "() => { const u = localStorage.getItem('CURRENT_USER'); "
+        "return u ? JSON.parse(u).addr : null; }"
+    )
+
+
 def best_xi_rating(players, formation):
     """Greedily fill formation slots with highest-OVR eligible players.
     Falls back to best remaining player if no positional match is left.
@@ -255,26 +296,62 @@ def find_similar_opponents(my_club_id, formation, tolerance, division_radius, ma
 
 
 # ---------------------------------------------------------------------------
+# Browser session helpers (real login, reused across club-picking and playing)
+# ---------------------------------------------------------------------------
+
+def open_browser_session(p):
+    """Launch (or resume) a real, logged-in MFL browser session.
+    Returns (browser, context). Caller is responsible for closing browser."""
+    if SESSION_FILE.exists():
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context(storage_state=str(SESSION_FILE))
+    else:
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context()
+        page = context.new_page()
+        page.goto("https://app.playmfl.com")
+        print("\nA browser window has opened. Please log into MFL there.")
+        input("Once you're logged in and see your dashboard, press Enter here to continue...")
+        context.storage_state(path=str(SESSION_FILE))
+    return browser, context
+
+
+def resolve_club_id(explicit_club_id):
+    """Return explicit_club_id if given, otherwise open a browser session,
+    detect the logged-in wallet, and let the user pick from their clubs."""
+    if explicit_club_id:
+        return explicit_club_id, None, None
+
+    from playwright.sync_api import sync_playwright
+    p = sync_playwright().start()
+    browser, context = open_browser_session(p)
+    wallet = detect_my_wallet_address(context)
+    context.storage_state(path=str(SESSION_FILE))
+    if not wallet:
+        print("Couldn't detect your wallet address from the session - pass --club-id instead.")
+        browser.close()
+        p.stop()
+        sys.exit(1)
+    club_id = pick_club_interactively(wallet)
+    # Keep the browser/context/p alive so play_friendlies can reuse them.
+    return club_id, browser, (context, p)
+
+
+# ---------------------------------------------------------------------------
 # Actually playing friendlies (real browser, real session)
 # ---------------------------------------------------------------------------
 
-def play_friendlies(my_club_id, matches, count, interval):
-    from playwright.sync_api import sync_playwright
+def play_friendlies(my_club_id, matches, count, interval, existing=None):
+    if existing:
+        browser, (context, p) = existing
+        _own_playwright = None
+    else:
+        from playwright.sync_api import sync_playwright
+        _own_playwright = sync_playwright().start()
+        browser, context = open_browser_session(_own_playwright)
 
-    with sync_playwright() as p:
-        if SESSION_FILE.exists():
-            browser = p.chromium.launch(headless=False)
-            context = browser.new_context(storage_state=str(SESSION_FILE))
-            page = context.new_page()
-        else:
-            browser = p.chromium.launch(headless=False)
-            context = browser.new_context()
-            page = context.new_page()
-            page.goto("https://app.playmfl.com")
-            print("\nA browser window has opened. Please log into MFL there.")
-            input("Once you're logged in and see your dashboard, press Enter here to continue...")
-            context.storage_state(path=str(SESSION_FILE))
-
+    try:
+        page = context.pages[0] if context.pages else context.new_page()
         played = 0
         for m in matches:
             if played >= count:
@@ -307,7 +384,10 @@ def play_friendlies(my_club_id, matches, count, interval):
                 time.sleep(wait_s)
 
         context.storage_state(path=str(SESSION_FILE))
+    finally:
         browser.close()
+        if _own_playwright:
+            _own_playwright.stop()
 
 
 if __name__ == "__main__":
@@ -317,7 +397,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find and play MFL friendlies against similarly-rated clubs.")
     parser.add_argument("--build-index", action="store_true",
                          help="One-time (or refresh) scan of all club ids into club_index.json, then exit")
-    parser.add_argument("--club-id", type=int, help="Your club's numeric id (from the app.playmfl.com/clubs/<id> URL)")
+    parser.add_argument("--club-id", type=int, default=None,
+                         help="Your club's numeric id (from the app.playmfl.com/clubs/<id> URL). "
+                              "If omitted, a browser window opens so you can pick from your own clubs.")
     parser.add_argument("--formation", default="4-3-3", choices=list(FORMATIONS.keys()))
     parser.add_argument("--tolerance", type=float, default=3.0, help="Max OVR gap to count as 'similar'")
     parser.add_argument("--division-radius", type=int, default=1,
@@ -332,19 +414,25 @@ if __name__ == "__main__":
         build_index()
         sys.exit(0)
 
-    if not args.club_id:
-        parser.error("--club-id is required (unless using --build-index)")
-
     if args.interval < MIN_INTERVAL_SECONDS:
         print(f"Note: raising --interval to the {MIN_INTERVAL_SECONDS}s cooldown minimum.")
         args.interval = MIN_INTERVAL_SECONDS
 
+    # If --club-id wasn't given, this opens a browser, detects who you're
+    # logged in as, and lets you pick from your own clubs. That browser
+    # session (browser, (context, playwright)) is returned so play_friendlies
+    # can reuse it instead of logging in twice.
+    club_id, reused_browser, reused_ctx = resolve_club_id(args.club_id)
+
     my_rating, matches = find_similar_opponents(
-        args.club_id, args.formation, args.tolerance, args.division_radius
+        club_id, args.formation, args.tolerance, args.division_radius
     )
 
     if not matches:
         print("\nNo similarly-rated opponents found. Try a larger --tolerance or --division-radius.")
+        if reused_browser:
+            reused_browser.close()
+            reused_ctx[1].stop()
         sys.exit(0)
 
     print(f"\nFound {len(matches)} candidate(s) within {args.tolerance} OVR:")
@@ -352,6 +440,10 @@ if __name__ == "__main__":
         print(f"  {m['name']:30s} rating {m['rating']:.1f}  gap {m['gap']:.1f}")
 
     if args.dry_run:
+        if reused_browser:
+            reused_browser.close()
+            reused_ctx[1].stop()
         sys.exit(0)
 
-    play_friendlies(args.club_id, matches, args.count, args.interval)
+    existing = (reused_browser, reused_ctx) if reused_browser else None
+    play_friendlies(club_id, matches, args.count, args.interval, existing=existing)
